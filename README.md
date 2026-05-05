@@ -40,6 +40,18 @@ curl -X POST http://127.0.0.1:8000/jobs/parse \
   -d '{"url":"https://example.com/job-posting"}'
 ```
 
+Send a Slack test message:
+
+```bash
+curl -X POST http://127.0.0.1:8000/slack/test
+```
+
+Send deadline reminders for Notion jobs due in 1 or 3 days:
+
+```bash
+curl -X POST http://127.0.0.1:8000/reminders/deadlines
+```
+
 Notion DB 속성명은 현재 아래 이름을 기준으로 저장합니다.
 
 ```text

@@ -4,9 +4,10 @@ from httpx import HTTPStatusError
 
 from app.agent import extract_job
 from app.config import get_settings
-from app.notion_client import create_job_page
+from app.notion_client import create_job_page, query_deadline_reminders
 from app.parser import fetch_job_text
 from app.schemas import ParseJobRequest, ParseJobResponse
+from app.slack_notifier import build_deadline_message, send_slack_message
 
 
 app = FastAPI(title="Job Agent")
@@ -117,6 +118,18 @@ INDEX_HTML = """
     }
     #status.ok { color: var(--ok); }
     #status.error { color: var(--danger); }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+    .secondary {
+      background: #344054;
+    }
+    .secondary:hover {
+      background: #1d2939;
+    }
     .result {
       display: none;
       margin-top: 18px;
@@ -178,6 +191,10 @@ INDEX_HTML = """
         <button id="submit" type="submit">공고 추가</button>
       </form>
       <div id="status"></div>
+      <div class="actions">
+        <button id="reminder" class="secondary" type="button">마감 알림 보내기</button>
+        <button id="slack-test" class="secondary" type="button">Slack 테스트</button>
+      </div>
     </section>
 
     <section id="result" class="panel result" aria-live="polite">
@@ -215,6 +232,8 @@ INDEX_HTML = """
     const form = document.querySelector("#job-form");
     const input = document.querySelector("#url");
     const button = document.querySelector("#submit");
+    const reminderButton = document.querySelector("#reminder");
+    const slackTestButton = document.querySelector("#slack-test");
     const statusEl = document.querySelector("#status");
     const resultEl = document.querySelector("#result");
 
@@ -261,6 +280,40 @@ INDEX_HTML = """
         button.disabled = false;
       }
     });
+
+    reminderButton.addEventListener("click", async () => {
+      reminderButton.disabled = true;
+      setStatus("Notion에서 D-1, D-3 마감 공고를 조회하고 Slack으로 보내는 중입니다.");
+      try {
+        const response = await fetch("/reminders/deadlines", { method: "POST" });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || "알림 발송에 실패했습니다.");
+        }
+        setStatus(`Slack 알림을 보냈습니다. 대상 공고 ${data.count}개.`, "ok");
+      } catch (error) {
+        setStatus(error.message, "error");
+      } finally {
+        reminderButton.disabled = false;
+      }
+    });
+
+    slackTestButton.addEventListener("click", async () => {
+      slackTestButton.disabled = true;
+      setStatus("Slack 테스트 메시지를 보내는 중입니다.");
+      try {
+        const response = await fetch("/slack/test", { method: "POST" });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || "Slack 테스트에 실패했습니다.");
+        }
+        setStatus(data.message, "ok");
+      } catch (error) {
+        setStatus(error.message, "error");
+      } finally {
+        slackTestButton.disabled = false;
+      }
+    });
   </script>
 </body>
 </html>
@@ -277,6 +330,13 @@ def health() -> dict:
     return {"ok": True}
 
 
+def _get_slack_webhook_url() -> str:
+    webhook_url = get_settings().slack_webhook_url
+    if not webhook_url:
+        raise HTTPException(status_code=400, detail="SLACK_WEBHOOK_URL is not configured.")
+    return webhook_url
+
+
 @app.post("/jobs/parse", response_model=ParseJobResponse)
 async def parse_job(request: ParseJobRequest) -> ParseJobResponse:
     settings = get_settings()
@@ -286,6 +346,33 @@ async def parse_job(request: ParseJobRequest) -> ParseJobResponse:
         job = await extract_job(text, source_url, settings)
         notion_page_id = await create_job_page(job, settings)
         return ParseJobResponse(job=job, notion_page_id=notion_page_id)
+    except HTTPStatusError as exc:
+        message = exc.response.text[:500] if exc.response is not None else str(exc)
+        raise HTTPException(status_code=502, detail=message) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/slack/test")
+async def slack_test() -> dict:
+    try:
+        await send_slack_message(_get_slack_webhook_url(), "Job Agent Slack 연결 테스트입니다.")
+        return {"ok": True, "message": "Slack 테스트 메시지를 보냈습니다."}
+    except HTTPStatusError as exc:
+        message = exc.response.text[:500] if exc.response is not None else str(exc)
+        raise HTTPException(status_code=502, detail=message) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/reminders/deadlines")
+async def send_deadline_reminders() -> dict:
+    settings = get_settings()
+    try:
+        jobs = await query_deadline_reminders(settings)
+        message = build_deadline_message(jobs)
+        await send_slack_message(_get_slack_webhook_url(), message)
+        return {"ok": True, "count": len(jobs), "message": message}
     except HTTPStatusError as exc:
         message = exc.response.text[:500] if exc.response is not None else str(exc)
         raise HTTPException(status_code=502, detail=message) from exc

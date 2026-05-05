@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Optional
 
 import httpx
@@ -47,21 +48,73 @@ def build_page_properties(job: ExtractedJob) -> dict:
     return properties
 
 
+def _headers(settings: Settings) -> dict:
+    return {
+        "Authorization": f"Bearer {settings.notion_api_key}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _plain_text(items: list[dict]) -> str:
+    return "".join(item.get("plain_text", "") for item in items)
+
+
+def _select_name(prop: dict) -> Optional[str]:
+    value = prop.get("select")
+    if not value:
+        return None
+    return value.get("name")
+
+
+def _page_to_job_summary(page: dict) -> dict:
+    props = page.get("properties", {})
+    deadline = props.get("마감일", {}).get("date") or {}
+    return {
+        "company_name": _plain_text(props.get("기업명", {}).get("title", [])),
+        "role": _select_name(props.get("직군", {})),
+        "platform": _select_name(props.get("플랫폼", {})),
+        "status": _select_name(props.get("상태", {})),
+        "deadline": deadline.get("start"),
+        "url": props.get("공고 URL", {}).get("url"),
+        "notion_url": page.get("url"),
+    }
+
+
 async def create_job_page(job: ExtractedJob, settings: Settings) -> str:
     payload = {
         "parent": {"database_id": settings.notion_database_id},
         "properties": build_page_properties(job),
     }
-    headers = {
-        "Authorization": f"Bearer {settings.notion_api_key}",
-        "Notion-Version": NOTION_VERSION,
-        "Content-Type": "application/json",
-    }
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             "https://api.notion.com/v1/pages",
-            headers=headers,
+            headers=_headers(settings),
             json=payload,
         )
         response.raise_for_status()
         return response.json()["id"]
+
+
+async def query_deadline_reminders(settings: Settings, today: Optional[date] = None) -> list[dict]:
+    base_date = today or date.today()
+    target_dates = [
+        (base_date + timedelta(days=1)).isoformat(),
+        (base_date + timedelta(days=3)).isoformat(),
+    ]
+    payload = {
+        "filter": {
+            "or": [
+                {"property": "마감일", "date": {"equals": target_dates[0]}},
+                {"property": "마감일", "date": {"equals": target_dates[1]}},
+            ]
+        },
+        "sorts": [{"property": "마감일", "direction": "ascending"}],
+    }
+    url = f"https://api.notion.com/v1/databases/{settings.notion_database_id}/query"
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(url, headers=_headers(settings), json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    return [_page_to_job_summary(page) for page in data.get("results", [])]
